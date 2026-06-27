@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite both the software archive and the article below."
+title: "Armed conflict and reported disease outbreaks: a global country-year analysis — replication code"
+abstract: "Replication code building a balanced country-year panel (236 countries/territories, 1996–2024) linking WHO Disease Outbreak News to the UCDP/PRIO Armed Conflict Dataset v25.1, with within-country fixed-effects models of conflict and reported outbreaks."
+type: software
+authors:
+  - family-names: "Seven"
+    given-names: "Ümit"
+    affiliation: "Humanitarian and Conflict Response Institute, University of Manchester"
+    # orcid: "https://orcid.org/0000-0000-0000-0000"   # add your ORCID
+  - family-names: "Martinez Juarez"
+    given-names: "Luis"
+    affiliation: "Humanitarian and Conflict Response Institute, University of Manchester"
+    # orcid: "https://orcid.org/0000-0000-0000-0000"   # add ORCID
+license: MIT
+version: "1.0.0"
+date-released: "2026-06-27"          # set to your Zenodo release date
+# doi: "10.5281/zenodo.XXXXXXX"       # uncomment and fill after the first Zenodo release
+repository-code: "https://github.com/USERNAME/REPO"   # set to your GitHub URL
+keywords:
+  - armed conflict
+  - disease outbreaks
+  - disease surveillance
+  - fixed-effects models
+  - global health
+preferred-citation:
+  type: article
+  title: "Armed conflict and reported disease outbreaks: a global country-year analysis, 1996–2024"
+  authors:
+    - family-names: "Seven"
+      given-names: "Ümit"
+    - family-names: "Martinez Juarez"
+      given-names: "Luis"
+  year: 2026
+  # journal: "The Lancet Global Health"   # fill in on acceptance
+  # doi: "10.xxxx/xxxxx"                   # fill in on publication
+  notes: "Under review."

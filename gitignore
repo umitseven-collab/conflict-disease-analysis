@@ -1,0 +1,19 @@
+# Data are not redistributed (see README); keep them out of the repo
+data/
+*.xlsx
+*.csv
+!**/example_*.csv
+
+# Generated outputs
+outputs/
+
+# R / RStudio cruft
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj.bak
+
+# OS files
+.DS_Store
+Thumbs.db
