@@ -1,862 +1,843 @@
-# =============================================================================
-# Armed conflict and reported disease outbreaks:
-# a global country-year analysis, 1996-2024
+# Armed conflict and the composition of WHO-reported infectious disease outbreaks,
+# a global country-year analysis, 1996-2024.
+# Seven U, Martinez Juarez L. Conflict and Health (in revision).
+# Contact: umit.seven@manchester.ac.uk. Licence: MIT.
 #
-# Replication code for the manuscript:
-#   Seven U, Martinez Juarez L. "Armed conflict and reported disease
-#   outbreaks: a global country-year analysis, 1996-2024." (under review).
+# Data (not included; put the files in ./data or in the working folder):
+#   disease_outbreaks_HDX.xlsx - WHO Disease Outbreak News, compiled by Torres Munguia et al.
+#     https://data.humdata.org/dataset/global-pandemic-and-epidemic-outbreaks
+#   UcdpPrioConflict_v25_1.csv - UCDP/PRIO Armed Conflict Dataset, version 25.1
+#     https://ucdp.uu.se/downloads/
+#   World Development Indicators are downloaded on the first run and saved as
+#   wdi_cache.csv, which is reused afterwards.
 #
-# Authors:  Ümit Seven; Luis Martinez Juarez
-#           Humanitarian and Conflict Response Institute,
-#           University of Manchester, UK.
-# Contact:  umit.seven@manchester.ac.uk
-#
-# Software archive (cite this version): https://doi.org/10.5281/zenodo.XXXXXXX
-# Source code:                          https://github.com/<username>/<repo>
-# License:  MIT (see LICENSE).
-#
-# -----------------------------------------------------------------------------
-# DATA (not redistributed here; all sources are publicly available)
-#   1. WHO Disease Outbreak News, structured by Torres Munguía et al., via the
-#      Humanitarian Data Exchange (HDX):
-#        https://data.humdata.org/dataset/global-pandemic-and-epidemic-outbreaks
-#        Expected file: disease_outbreaks_HDX.xlsx   (CC BY-NC-SA 3.0 IGO)
-#   2. UCDP/PRIO Armed Conflict Dataset, version 25.1:
-#        https://ucdp.uu.se/downloads/
-#        Expected file: UcdpPrioConflict_v25_1.csv
-#   3. World Bank World Development Indicators, pulled live via the WDI package
-#      / World Bank Open Data API (https://api.worldbank.org).
-#
-# HOW TO RUN
-#   * Install R (>= 4.4.0). Missing packages are installed automatically below.
-#   * Download the two data files above and place them in a "data/" subfolder,
-#     or set the CONFLICT_DATA_DIR environment variable to their location.
-#   * Outputs are written to "outputs/" (override with CONFLICT_OUT_DIR).
-#   * Run start to finish, e.g. source("conflict_disease_analysis.R").
-#
-# REPRODUCIBILITY
-#   * A global seed (set.seed(2024)) makes the Monte Carlo chi-square test and
-#     the cluster bootstrap reproducible.
-#   * WDI series are fetched live and may be revised by the World Bank; record
-#     your access date for exact reproduction.
-#   * sessionInfo() is written to outputs/sessionInfo.txt at the end of the run.
-# =============================================================================
+# Run with source("conflict_disease_analysis.R"). The bootstrap takes about 20 minutes.
 
 
-# 0. Packages -----------------------------------------------------------------
-# Install only the packages that are missing, then load them. If you manage
-# dependencies with renv, comment out the install step.
-required_packages <- c(
-  "readxl", "readr", "dplyr", "tidyr", "stringr", "purrr", "janitor",
-  "countrycode", "fixest", "nnet", "broom", "ggplot2", "scales", "WDI",
-  "tibble", "MASS"
-)
-missing_packages <- setdiff(required_packages, rownames(installed.packages()))
-if (length(missing_packages) > 0) install.packages(missing_packages)
+# 0. Setup --------------------------------------------------------------------
+library(readxl); library(readr); library(dplyr); library(tidyr); library(stringr)
+library(purrr); library(tibble); library(countrycode); library(fixest); library(nnet)
+library(broom); library(ggplot2); library(scales); library(WDI)
 
-library(readxl); library(readr); library(dplyr); library(tidyr)
-library(stringr); library(purrr); library(janitor); library(countrycode)
-library(fixest); library(nnet); library(broom); library(ggplot2)
-library(scales); library(WDI); library(tibble)
-# MASS is used only as MASS::glm.nb() (a fallback) and is deliberately NOT
-# attached, so it cannot mask dplyr::select().
+set.seed(2024)
+setFixest_notes(FALSE)
 
-set.seed(2024)  # reproducibility: Monte Carlo chi-square (sec. 6) and bootstrap
+data_dir <- if (dir.exists("data")) "data" else "."
+out_dir  <- "outputs_final"
+dir.create(out_dir, showWarnings = FALSE)
 
+find_file <- function(pattern) {
+  f <- list.files(data_dir, pattern = pattern, full.names = TRUE)
+  if (length(f) != 1) stop("Need exactly one file matching '", pattern, "' in ", data_dir)
+  f
+}
+who_path  <- find_file("^disease_outbreaks_HDX.*\\.xlsx$")
+ucdp_path <- find_file("^UcdpPrioConflict_v25_1.*\\.csv$")
+wdi_cache <- file.path(data_dir, "wdi_cache.csv")
 
-# 1. Paths --------------------------------------------------------------------
-# Point the script at the folder holding the two input data files. Default:
-# a "data" subfolder of the working directory; override via environment vars.
-data_dir <- Sys.getenv("CONFLICT_DATA_DIR", unset = "data")
-out_dir  <- Sys.getenv("CONFLICT_OUT_DIR",  unset = "outputs")
-
-who_path  <- file.path(data_dir, "disease_outbreaks_HDX.xlsx")
-ucdp_path <- file.path(data_dir, "UcdpPrioConflict_v25_1.csv")
-
-if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
-
-if (!file.exists(who_path) || !file.exists(ucdp_path)) {
-  stop("Input data not found in '", data_dir, "'. See README.md for how to ",
-       "obtain disease_outbreaks_HDX.xlsx and UcdpPrioConflict_v25_1.csv, then ",
-       "place them in that folder (or set CONFLICT_DATA_DIR).", call. = FALSE)
+normalise_iso <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  replace(x, x %in% c("KOS", "XXK"), "XKX")   # Kosovo
 }
 
 
-# 2. WHO data -----------------------------------------------------------------
-who_raw <- read_excel(who_path)
+# 1. Parameters ---------------------------------------------------------------
+years       <- 1996:2024
+B_BOOT      <- 1999
+BOOT_SEED   <- 1
+CTRL        <- c("log_pop", "log_gdp_pc", "urban_pct")
+CTRL_LAG    <- c("log_pop_l1", "log_gdp_pc_l1", "urban_pct_l1")
+HEADLINE    <- c("A80", "A00", "A98", "J09")   # polio, cholera, other VHF, J09 influenza
+EXTRA_DIS   <- c("B05", "A39")                 # measles, meningococcal disease
+WPV_ENDEMIC <- c("AFG", "PAK", "NGA")
+COVID_CODES <- c("U07", "U08", "U09", "U10")   # U04 (SARS/MERS) is kept
 
-who <- who_raw %>%
-  filter(!str_starts(as.character(id_outbreak), "#")) %>%
-  mutate(Year = suppressWarnings(as.integer(Year))) %>%
-  filter(!is.na(Year), Year >= 1996, Year <= 2024)
+# Units that did not exist for the whole period
+existence <- tribble(
+  ~iso3, ~first, ~last,
+  "SSD",  2011,  NA,
+  "XKX",  2008,  NA,
+  "MNE",  2006,  NA,
+  "SCG",  NA,    2005,
+  "ANT",  NA,    2010,
+  "CUW",  2011,  NA,
+  "SXM",  2011,  NA,
+  "BES",  2011,  NA,
+  "TLS",  2002,  NA
+)
 
-who_covid <- who %>% filter(str_starts(icd104c, "U07"))
-who_main  <- who %>% filter(!str_starts(icd104c, "U07"))
+nice_label <- c(
+  J09 = "Zoonotic/pandemic influenza", A00 = "Cholera", A80 = "Acute poliomyelitis",
+  A95 = "Yellow fever", A90 = "Dengue", A39 = "Meningococcal infection",
+  A87 = "Viral meningitis", B05 = "Measles", A98 = "Other viral haemorrhagic fevers",
+  A92 = "Other mosquito-borne viral fevers", A99 = "Unspecified viral haemorrhagic fever",
+  B04 = "Mpox", A96 = "Arenaviral haemorrhagic fever", U04 = "SARS and MERS",
+  B17 = "Other acute viral hepatitis", B34 = "Viral infection, unspecified site",
+  A20 = "Plague", A02 = "Other salmonella infections", B15 = "Acute hepatitis A")
+lab_of <- function(code, name) ifelse(code %in% names(nice_label), nice_label[code], name)
 
+
+# 2. WHO Disease Outbreak News ------------------------------------------------
+who <- read_excel(who_path) %>%
+  filter(!str_starts(as.character(id_outbreak), "#")) %>%   # drop the HXL tag row
+  mutate(Year = suppressWarnings(as.integer(Year)), iso3 = normalise_iso(iso3)) %>%
+  filter(!is.na(Year), Year %in% years) %>%
+  mutate(is_covid = str_sub(icd103c, 1, 3) %in% COVID_CODES |
+           str_sub(icd104c, 1, 3) %in% COVID_CODES)
+
+if (any(is.na(who$iso3) | !grepl("^[A-Z]{3}$", who$iso3)))
+  stop("Missing or malformed ISO3 code in the WHO data")
+
+who_covid <- who %>% filter(is_covid)
+who_main  <- who %>% filter(!is_covid, !is.na(icd103c))
+
+# one record per disease category per country-year
 who_cyd <- who_main %>%
   distinct(iso3, Year, icd103c, .keep_all = TRUE) %>%
   transmute(iso3, year = Year, icd103c, icd103n, Disease)
 
-cat("WHO file:", nrow(who), "rows (non-COVID:", nrow(who_main), ").\n")
 
+# 3. UCDP/PRIO conflict data --------------------------------------------------
+ucdp <- read_csv(ucdp_path, show_col_types = FALSE)   # full history, needed for lags and duration
+if (any(as.character(ucdp$version) != "25.1")) stop("Expected UCDP/PRIO version 25.1")
 
-# 3. UCDP data ----------------------------------------------------------------
-ucdp_raw <- read_csv(ucdp_path, show_col_types = FALSE)
-ucdp <- ucdp_raw %>% filter(year >= 1996, year <= 2024)
-
+# multi-country conflicts are split so each country in gwno_loc gets the conflict
 ucdp_long <- ucdp %>%
   mutate(gwno_loc = as.character(gwno_loc)) %>%
   separate_rows(gwno_loc, sep = ",\\s*") %>%
   mutate(gwno_loc = suppressWarnings(as.integer(str_trim(gwno_loc)))) %>%
-  filter(!is.na(gwno_loc))
-
-ucdp_long <- ucdp_long %>%
+  filter(!is.na(gwno_loc)) %>%
   mutate(iso3 = suppressWarnings(countrycode(
     gwno_loc, origin = "gwn", destination = "iso3c",
-    custom_match = c(
-      `260` = "DEU", `265` = "DDR", `345` = "SRB", `347` = "KOS",
-      `625` = "SDN", `626` = "SSD", `678` = "YEM", `816` = "VNM"
-    )
-  )))
+    custom_match = c(`260` = "DEU", `265` = "DDR", `345` = "SRB", `347` = "XKX",
+                     `625` = "SDN", `626` = "SSD", `678` = "YEM", `816` = "VNM"))),
+    iso3 = normalise_iso(iso3))
 
-unmatched <- ucdp_long %>% filter(is.na(iso3)) %>% count(gwno_loc, location)
-if (nrow(unmatched) > 0) { cat("Unmatched GW codes:\n"); print(unmatched) }
+if (any(is.na(ucdp_long$iso3) & ucdp_long$year %in% years))
+  stop("Some UCDP country codes in 1996-2024 could not be matched")
 ucdp_long <- ucdp_long %>% filter(!is.na(iso3))
 
+# country-year exposure; if types overlap, internationalised intrastate wins,
+# then intrastate, interstate, extrasystemic. Intensity is the highest level.
 ucdp_cy <- ucdp_long %>%
   group_by(iso3, year) %>%
   summarise(
     any_conflict   = 1L,
     n_conflicts    = n_distinct(conflict_id),
-    max_intensity  = max(intensity_level, na.rm = TRUE),
     war            = as.integer(any(intensity_level == 2L, na.rm = TRUE)),
-    has_extrasys   = as.integer(any(type_of_conflict == 1L)),
-    has_interstate = as.integer(any(type_of_conflict == 2L)),
-    has_intrastate = as.integer(any(type_of_conflict == 3L)),
     has_intl_intra = as.integer(any(type_of_conflict == 4L)),
-    conflict_type = case_when(
+    conflict_type  = case_when(
       any(type_of_conflict == 4L) ~ "internationalised_intrastate",
       any(type_of_conflict == 3L) ~ "intrastate",
       any(type_of_conflict == 2L) ~ "interstate",
-      any(type_of_conflict == 1L) ~ "extrasystemic",
-      TRUE ~ NA_character_
-    ),
-    .groups = "drop"
-  )
+      any(type_of_conflict == 1L) ~ "extrasystemic"),
+    .groups = "drop")
 
 
 # 4. Country-year panel -------------------------------------------------------
 iso3_universe <- unique(who$iso3)
-years         <- 1996:2024
+type_levels   <- c("none", "extrasystemic", "interstate", "intrastate",
+                   "internationalised_intrastate")
+mk_intensity  <- function(any_c, war)
+  factor(case_when(war == 1L ~ "war", any_c == 1L ~ "minor", TRUE ~ "none"),
+         levels = c("none", "minor", "war"))
+
+# Lags and duration use the whole UCDP record back to 1946.
+# Duration counts consecutive years with any conflict.
+history <- expand_grid(iso3 = iso3_universe, year = min(ucdp_long$year):max(years)) %>%
+  left_join(ucdp_cy %>% select(iso3, year, any_conflict, war, conflict_type),
+            by = c("iso3", "year")) %>%
+  mutate(any_conflict  = replace_na(any_conflict, 0L),
+         war           = replace_na(war, 0L),
+         conflict_type = factor(replace_na(conflict_type, "none"), levels = type_levels),
+         intensity     = mk_intensity(any_conflict, war)) %>%
+  arrange(iso3, year) %>%
+  group_by(iso3) %>%
+  mutate(conflict_type_lag1 = lag(conflict_type, 1),
+         conflict_type_lag2 = lag(conflict_type, 2),
+         intensity_lag1     = lag(intensity, 1),
+         intensity_lag2     = lag(intensity, 2),
+         spell = { r <- rle(any_conflict); sequence(r$lengths) * rep(r$values, r$lengths) }) %>%
+  ungroup() %>%
+  mutate(duration = factor(case_when(spell == 0 ~ "none", spell <= 2 ~ "1-2 yrs",
+                                     spell <= 5 ~ "3-5 yrs", TRUE ~ "6+ yrs"),
+                           levels = c("none", "1-2 yrs", "3-5 yrs", "6+ yrs")),
+         intensity_duration = factor(case_when(
+           intensity == "none"               ~ "none",
+           intensity == "minor" & spell <= 2 ~ "minor, 1-2 yrs",
+           intensity == "minor"              ~ "minor, 3+ yrs",
+           spell <= 2                        ~ "war, 1-2 yrs",
+           TRUE                              ~ "war, 3+ yrs"),
+           levels = c("none", "minor, 1-2 yrs", "minor, 3+ yrs", "war, 1-2 yrs", "war, 3+ yrs"))) %>%
+  filter(year %in% years) %>%
+  select(iso3, year, conflict_type_lag1, conflict_type_lag2, intensity_lag1,
+         intensity_lag2, spell, duration, intensity_duration)
 
 outbreaks_cy <- who_main %>%
-  group_by(iso3, Year) %>%
-  summarise(n_outbreaks = n_distinct(icd103c), .groups = "drop") %>%
-  rename(year = Year)
+  group_by(iso3, year = Year) %>%
+  summarise(n_outbreaks = n_distinct(icd103c), .groups = "drop")
 
 region_lookup <- who %>%
-  distinct(iso3, Country, who_region, unsd_region, unsd_subregion)
+  distinct(iso3, Country, who_region, unsd_region, unsd_subregion) %>%
+  group_by(iso3) %>% slice(1) %>% ungroup()
 
-panel <- expand_grid(iso3 = iso3_universe, year = years) %>%
+# for new units, lags that point to years before the unit existed are set to missing
+frame <- expand_grid(iso3 = iso3_universe, year = years) %>%
   left_join(ucdp_cy, by = c("iso3", "year")) %>%
   left_join(outbreaks_cy, by = c("iso3", "year")) %>%
   left_join(region_lookup, by = "iso3") %>%
-  mutate(
-    across(c(any_conflict, n_conflicts, war,
-             has_extrasys, has_interstate, has_intrastate, has_intl_intra,
-             n_outbreaks),
-           ~ replace_na(., 0L)),
-    conflict_type = replace_na(conflict_type, "none"),
-    conflict_type = factor(conflict_type,
-                           levels = c("none", "extrasystemic", "interstate",
-                                      "intrastate", "internationalised_intrastate")),
-    # Three-level intensity factor for the dose-response specification:
-    #   "none"  = no UCDP-recorded conflict in country-year
-    #   "minor" = at least one conflict at intensity_level == 1 (25-999 BRD)
-    #   "war"   = at least one conflict at intensity_level == 2 (>=1000 BRD)
-    intensity = case_when(
-      war == 1L                         ~ "war",
-      any_conflict == 1L & war == 0L    ~ "minor",
-      TRUE                              ~ "none"
-    ),
-    intensity = factor(intensity, levels = c("none", "minor", "war")),
-    any_outbreak  = as.integer(n_outbreaks > 0)
-  )
+  mutate(across(c(any_conflict, n_conflicts, war, has_intl_intra, n_outbreaks), ~ replace_na(., 0L)),
+         conflict_type = factor(replace_na(conflict_type, "none"), levels = type_levels),
+         intensity     = mk_intensity(any_conflict, war),
+         any_outbreak  = as.integer(n_outbreaks > 0)) %>%
+  left_join(history, by = c("iso3", "year")) %>%
+  left_join(existence, by = "iso3") %>%
+  mutate(exists = (is.na(first) | year >= first) & (is.na(last) | year <= last),
+         across(c(conflict_type_lag1, intensity_lag1),
+                ~ replace(., !is.na(first) & year < first + 1, NA)),
+         across(c(conflict_type_lag2, intensity_lag2),
+                ~ replace(., !is.na(first) & year < first + 2, NA)))
 
-cat("Panel built:", nrow(panel), "country-years across",
-    n_distinct(panel$iso3), "countries.\n")
-cat("\nIntensity distribution:\n"); print(table(panel$intensity, useNA = "ifany"))
+# drop country-years before a unit existed, and record what was dropped
+nonexistent <- frame %>% filter(!exists) %>%
+  group_by(iso3) %>%
+  summarise(n_dropped = n(), years = paste(range(year), collapse = "-"),
+            outbreaks = sum(n_outbreaks), conflict_years = sum(any_conflict), .groups = "drop")
+write_csv(nonexistent, file.path(out_dir, "nonexistent_country_years.csv"))
+
+panel <- frame %>% filter(exists) %>% select(-first, -last, -exists)
+stopifnot(!any(duplicated(panel[, c("iso3", "year")])))
+cat("Panel:", nrow(panel), "country-years,", n_distinct(panel$iso3), "units\n")
 
 
-# 5. Descriptive --------------------------------------------------------------
-desc_by_type <- panel %>%
-  group_by(conflict_type) %>%
-  summarise(n_country_years = n(),
-            pct_with_outbreak = mean(any_outbreak) * 100,
-            mean_outbreaks    = mean(n_outbreaks),
-            .groups = "drop")
-print(desc_by_type)
-write_csv(desc_by_type, file.path(out_dir, "desc_by_conflict_type.csv"))
-
-desc_by_intensity <- panel %>%
-  group_by(intensity) %>%
-  summarise(n_country_years = n(),
-            pct_with_outbreak = mean(any_outbreak) * 100,
-            mean_outbreaks    = mean(n_outbreaks),
-            .groups = "drop")
-print(desc_by_intensity)
-write_csv(desc_by_intensity, file.path(out_dir, "desc_by_intensity.csv"))
-
-
-# 6. Chi-square ---------------------------------------------------------------
-outbreak_with_conflict <- who_cyd %>%
-  left_join(panel %>% dplyr::select(iso3, year, conflict_type, intensity,
-                                    war, any_conflict),
-            by = c("iso3", "year"))
-
-top_diseases <- outbreak_with_conflict %>%
-  count(icd103c, icd103n, sort = TRUE) %>%
-  slice_head(n = 20)
-print(top_diseases)
-
-disease_labels <- top_diseases %>%
-  group_by(icd103c) %>%
-  summarise(icd103n = first(icd103n), .groups = "drop")
-
-xtab_counts <- outbreak_with_conflict %>%
-  filter(icd103c %in% top_diseases$icd103c) %>%
-  count(conflict_type, icd103c, icd103n)
-
-xtab_wide <- xtab_counts %>%
-  dplyr::select(conflict_type, icd103c, n) %>%
-  pivot_wider(names_from = icd103c, values_from = n,
-              values_fill = 0, values_fn = sum)
-
-mat <- as.matrix(xtab_wide[, -1]); rownames(mat) <- xtab_wide$conflict_type
-chi_res <- chisq.test(mat, simulate.p.value = TRUE, B = 10000)
-print(chi_res)
-
-resid_df <- as.data.frame(chi_res$stdres) %>%
-  tibble::rownames_to_column("conflict_type") %>%
-  pivot_longer(-conflict_type, names_to = "icd103c", values_to = "stdres") %>%
-  left_join(disease_labels, by = "icd103c")
-print(resid_df %>% arrange(desc(abs(stdres))) %>% head(20))
-write_csv(resid_df, file.path(out_dir, "chi2_residuals.csv"))
-
-
-# 7. Per-disease logistic regression (conflict type, no controls) -------------
-run_disease_logit <- function(disease_code, exposure = "conflict_type",
-                              data = panel, extra_covars = NULL,
-                              fe = "iso3 + year") {
-  d <- data %>%
-    left_join(
-      who_cyd %>% filter(icd103c == disease_code) %>%
-        mutate(this_outbreak = 1L) %>%
-        dplyr::select(iso3, year, this_outbreak),
-      by = c("iso3", "year")
-    ) %>%
-    mutate(this_outbreak = replace_na(this_outbreak, 0L))
-
-  rhs <- exposure
-  if (!is.null(extra_covars)) rhs <- paste(c(exposure, extra_covars), collapse = " + ")
-  f <- as.formula(paste0("this_outbreak ~ ", rhs, " | ", fe))
-
-  mod <- tryCatch(
-    feglm(f, data = d, family = binomial(), cluster = ~iso3),
-    error = function(e) NULL, warning = function(w) NULL
-  )
-  if (is.null(mod)) return(NULL)
-
-  ## --- effective-N / identification diagnostics ---------------------------
-  ## A within-country FE logit drops countries with no within-country outcome
-  ## variation, so the model is identified from the "switching" countries only.
-  ## We report the country-years used (mod$nobs) and the country fixed effects
-  ## retained (mod$fixef_sizes[["iso3"]]) for the manuscript table footnotes.
-  n_obs       <- tryCatch(as.integer(mod$nobs), error = function(e) NA_integer_)
-  n_countries <- tryCatch(as.integer(unname(mod$fixef_sizes[["iso3"]])),
-                          error = function(e) NA_integer_)
-  n_events    <- tryCatch(as.integer(sum(d$this_outbreak == 1L, na.rm = TRUE)),
-                          error = function(e) NA_integer_)
-
-  tidy(mod, conf.int = TRUE) %>%
-    mutate(icd103c = disease_code, spec = exposure, fe = fe,
-           controls = if (is.null(extra_covars)) "none" else "WDI",
-           n_obs = n_obs, n_countries = n_countries, n_events = n_events)
+# 5. World Development Indicators ---------------------------------------------
+if (file.exists(wdi_cache)) {
+  wdi_raw <- read_csv(wdi_cache, show_col_types = FALSE)
+} else {
+  wdi_raw <- WDI(country = "all",
+                 indicator = c(pop = "SP.POP.TOTL", gdp_pc = "NY.GDP.PCAP.PP.KD",
+                               urban_pct = "SP.URB.TOTL.IN.ZS"),
+                 start = min(years) - 1, end = max(years), extra = TRUE)
+  write_csv(wdi_raw, wdi_cache)
+  writeLines(format(Sys.Date()), file.path(data_dir, "wdi_cache_date.txt"))
 }
+write_csv(tibble(file = basename(c(who_path, ucdp_path, wdi_cache)),
+                 md5  = unname(tools::md5sum(c(who_path, ucdp_path, wdi_cache)))),
+          file.path(out_dir, "input_manifest.csv"))
 
-results_logit <- map_dfr(top_diseases$icd103c, run_disease_logit,
-                         exposure = "conflict_type", data = panel) %>%
-  left_join(disease_labels, by = "icd103c") %>%
-  mutate(odds_ratio = exp(estimate),
-         or_low     = exp(conf.low),
-         or_high    = exp(conf.high))
-print(results_logit %>% arrange(p.value) %>% head(20))
-write_csv(results_logit, file.path(out_dir, "logit_per_disease_type.csv"))
-
-
-# 8. Negative binomial (conflict type, no controls) ---------------------------
-nb_mod <- tryCatch(
-  fenegbin(n_outbreaks ~ conflict_type | iso3 + year,
-           data = panel, cluster = ~iso3),
-  error = function(e) {
-    cat("fenegbin failed, falling back to MASS::glm.nb.\n")
-    MASS::glm.nb(n_outbreaks ~ conflict_type + factor(who_region), data = panel)
-  }
-)
-print(summary(nb_mod))
-saveRDS(nb_mod, file.path(out_dir, "nb_model_type.rds"))
-
-
-# 8b. WDI controls and controlled re-runs (conflict type) ---------------------
-wdi_indicators <- c(
-  pop       = "SP.POP.TOTL",
-  gdp_pc    = "NY.GDP.PCAP.PP.KD",
-  health_pc = "SH.XPD.CHEX.PC.CD",
-  urban_pct = "SP.URB.TOTL.IN.ZS"
-)
-
-wdi_raw <- WDI(country = "all", indicator = wdi_indicators,
-               start = 1996, end = 2024, extra = TRUE)
+safe_log <- function(x) log(ifelse(is.finite(x) & x > 0, x, NA_real_))
 
 wdi <- wdi_raw %>%
   filter(!is.na(iso3c)) %>%
-  transmute(iso3 = iso3c, year,
-            log_pop       = log(pop),
-            log_gdp_pc    = log(gdp_pc),
-            log_health_pc = log(health_pc),
-            urban_pct)
-
-panel_ctrl <- panel %>% left_join(wdi, by = c("iso3", "year"))
-
-cat("\nMissingness (% NA) of WDI controls after merge:\n")
-print(panel_ctrl %>%
-        summarise(across(c(log_pop, log_gdp_pc, log_health_pc, urban_pct),
-                         ~ round(mean(is.na(.)) * 100, 1))))
-
-# Controlled NB, conflict type
-nb_mod_ctrl_type <- tryCatch(
-  fenegbin(n_outbreaks ~ conflict_type + log_pop + log_gdp_pc + urban_pct
-                         | iso3 + year,
-           data = panel_ctrl, cluster = ~iso3),
-  error = function(e) { cat("Controlled NB (type) failed:", conditionMessage(e), "\n"); NULL }
-)
-if (!is.null(nb_mod_ctrl_type)) {
-  cat("\nControlled NB, conflict type:\n")
-  print(summary(nb_mod_ctrl_type))
-  saveRDS(nb_mod_ctrl_type, file.path(out_dir, "nb_model_type_with_controls.rds"))
-}
-
-# Controlled per-disease logits, conflict type
-results_logit_ctrl <- map_dfr(top_diseases$icd103c, run_disease_logit,
-                              exposure = "conflict_type",
-                              data = panel_ctrl,
-                              extra_covars = c("log_pop","log_gdp_pc","urban_pct")) %>%
-  left_join(disease_labels, by = "icd103c") %>%
-  mutate(odds_ratio = exp(estimate),
-         or_low     = exp(conf.low),
-         or_high    = exp(conf.high))
-
-cat("\nControlled per-disease logits, conflict type (top 20 by p):\n")
-print(results_logit_ctrl %>%
-        filter(str_detect(term, "conflict_type")) %>%
-        arrange(p.value) %>% head(20))
-
-write_csv(results_logit_ctrl,
-          file.path(out_dir, "logit_per_disease_type_with_controls.csv"))
-
-
-# 8c. INTENSITY specification (parallel dose-response) ------------------------
-# Replace conflict_type with the three-level intensity factor and re-run the
-# negative binomial and per-disease logits, both without and with WDI controls.
-
-cat("\n--- Intensity-based specifications ---\n")
-
-# Uncontrolled NB, intensity
-nb_mod_int <- tryCatch(
-  fenegbin(n_outbreaks ~ intensity | iso3 + year,
-           data = panel, cluster = ~iso3),
-  error = function(e) {
-    cat("fenegbin (intensity) failed, falling back to MASS::glm.nb.\n")
-    MASS::glm.nb(n_outbreaks ~ intensity + factor(who_region), data = panel)
-  }
-)
-cat("\nUncontrolled NB, intensity:\n"); print(summary(nb_mod_int))
-saveRDS(nb_mod_int, file.path(out_dir, "nb_model_intensity.rds"))
-
-# Controlled NB, intensity
-nb_mod_int_ctrl <- tryCatch(
-  fenegbin(n_outbreaks ~ intensity + log_pop + log_gdp_pc + urban_pct
-                         | iso3 + year,
-           data = panel_ctrl, cluster = ~iso3),
-  error = function(e) { cat("Controlled NB (intensity) failed:", conditionMessage(e), "\n"); NULL }
-)
-if (!is.null(nb_mod_int_ctrl)) {
-  cat("\nControlled NB, intensity:\n")
-  print(summary(nb_mod_int_ctrl))
-  saveRDS(nb_mod_int_ctrl, file.path(out_dir, "nb_model_intensity_with_controls.rds"))
-}
-
-# Uncontrolled per-disease logits, intensity
-results_logit_int <- map_dfr(top_diseases$icd103c, run_disease_logit,
-                             exposure = "intensity", data = panel) %>%
-  left_join(disease_labels, by = "icd103c") %>%
-  mutate(odds_ratio = exp(estimate),
-         or_low     = exp(conf.low),
-         or_high    = exp(conf.high))
-
-cat("\nUncontrolled per-disease logits, intensity (top 20 by p):\n")
-print(results_logit_int %>%
-        filter(str_detect(term, "intensity")) %>%
-        arrange(p.value) %>% head(20))
-write_csv(results_logit_int, file.path(out_dir, "logit_per_disease_intensity.csv"))
-
-# Controlled per-disease logits, intensity
-results_logit_int_ctrl <- map_dfr(top_diseases$icd103c, run_disease_logit,
-                                  exposure = "intensity",
-                                  data = panel_ctrl,
-                                  extra_covars = c("log_pop","log_gdp_pc","urban_pct")) %>%
-  left_join(disease_labels, by = "icd103c") %>%
-  mutate(odds_ratio = exp(estimate),
-         or_low     = exp(conf.low),
-         or_high    = exp(conf.high))
-
-cat("\nControlled per-disease logits, intensity (top 20 by p):\n")
-print(results_logit_int_ctrl %>%
-        filter(str_detect(term, "intensity")) %>%
-        arrange(p.value) %>% head(20))
-write_csv(results_logit_int_ctrl,
-          file.path(out_dir, "logit_per_disease_intensity_with_controls.csv"))
-
-
-# 9. Multinomial logit (unchanged) --------------------------------------------
-mn_data <- outbreak_with_conflict %>%
-  filter(icd103c %in% top_diseases$icd103c) %>%
-  mutate(icd103c = factor(icd103c))
-ref_disease <- top_diseases$icd103c[1]
-mn_data$icd103c <- relevel(mn_data$icd103c, ref = ref_disease)
-
-mn_mod <- multinom(icd103c ~ conflict_type, data = mn_data, trace = FALSE)
-mn_summary <- summary(mn_mod)
-z <- mn_summary$coefficients / mn_summary$standard.errors
-mn_pvals <- (1 - pnorm(abs(z), 0, 1)) * 2
-print(round(z, 2)); print(round(mn_pvals, 3))
-saveRDS(mn_mod, file.path(out_dir, "multinom_model.rds"))
-
-
-# 10. Plot --------------------------------------------------------------------
-share_df <- outbreak_with_conflict %>%
-  filter(icd103c %in% top_diseases$icd103c) %>%
-  count(conflict_type, icd103n) %>%
-  group_by(conflict_type) %>%
-  mutate(prop = n / sum(n)) %>%
-  ungroup()
-
-p <- ggplot(share_df,
-            aes(x = reorder(icd103n, prop), y = prop, fill = conflict_type)) +
-  geom_col(position = "dodge") + coord_flip() +
-  labs(x = NULL,
-       y = "Share of reported outbreaks in country-years of this conflict type",
-       fill = "Conflict type",
-       title = "Disease profile of WHO-reported outbreaks, by UCDP conflict type",
-       subtitle = "Country-years 1996-2024, COVID-19 excluded") +
-  theme_minimal(base_size = 11) +
-  theme(legend.position = "bottom")
-print(p)
-ggsave(file.path(out_dir, "disease_share_by_conflict_type.png"),
-       p, width = 10, height = 7, dpi = 150)
-
-
-# 11. COVID side analysis -----------------------------------------------------
-covid_by_conflict <- who_covid %>%
-  rename(year = Year) %>%
-  left_join(panel %>% dplyr::select(iso3, year, conflict_type),
-            by = c("iso3", "year")) %>%
-  count(year, conflict_type)
-print(covid_by_conflict)
-
-
-# =============================================================================
-# 12. Effective-N / identification diagnostics (for table footnotes) ----------
-# run_disease_logit() now returns n_obs, n_countries, n_events, so every result
-# frame already carries these. Write compact summaries for the table diseases.
-diag_cols <- c("icd103c", "icd103n", "term", "odds_ratio", "or_low", "or_high",
-               "p.value", "n_obs", "n_countries", "n_events")
-
-eff_n_type <- results_logit_ctrl %>%
-  filter(str_detect(term, "conflict_type")) %>%
-  dplyr::select(any_of(diag_cols)) %>% arrange(p.value)
-eff_n_int <- results_logit_int_ctrl %>%
-  filter(str_detect(term, "intensity")) %>%
-  dplyr::select(any_of(diag_cols)) %>% arrange(p.value)
-
-cat("\n[12] Effective N, controlled type logits (table 2 footnote):\n")
-print(as.data.frame(eff_n_type))
-cat("\n[12] Effective N, controlled intensity logits (table 3 footnote):\n")
-print(as.data.frame(eff_n_int))
-write_csv(eff_n_type, file.path(out_dir, "effective_n_type.csv"))
-write_csv(eff_n_int,  file.path(out_dir, "effective_n_intensity.csv"))
-
-
-# =============================================================================
-# 13. Lagged conflict exposures (temporal precedence) -------------------------
-# Build 1- and 2-year within-country lags of the type and intensity factors.
-panel_ctrl <- panel_ctrl %>%
+  transmute(iso3 = normalise_iso(iso3c), year = as.integer(year),
+            log_pop = safe_log(pop), log_gdp_pc = safe_log(gdp_pc), urban_pct) %>%
+  distinct(iso3, year, .keep_all = TRUE) %>%
   arrange(iso3, year) %>%
   group_by(iso3) %>%
-  mutate(
-    conflict_type_lag1 = dplyr::lag(conflict_type, 1),
-    conflict_type_lag2 = dplyr::lag(conflict_type, 2),
-    intensity_lag1     = dplyr::lag(intensity, 1),
-    intensity_lag2     = dplyr::lag(intensity, 2)
-  ) %>%
+  mutate(log_pop_l1    = if_else(year - lag(year) == 1L, lag(log_pop), NA_real_),
+         log_gdp_pc_l1 = if_else(year - lag(year) == 1L, lag(log_gdp_pc), NA_real_),
+         urban_pct_l1  = if_else(year - lag(year) == 1L, lag(urban_pct), NA_real_)) %>%
   ungroup()
 
-lag_specs <- tibble::tribble(
-  ~exposure,            ~tag,
-  "intensity_lag1",     "intensity_lag1",
-  "intensity_lag2",     "intensity_lag2",
-  "conflict_type_lag1", "type_lag1",
-  "conflict_type_lag2", "type_lag2"
-)
-
-results_lag <- purrr::pmap_dfr(lag_specs, function(exposure, tag) {
-  map_dfr(top_diseases$icd103c, run_disease_logit,
-          exposure = exposure, data = panel_ctrl,
-          extra_covars = c("log_pop", "log_gdp_pc", "urban_pct")) %>%
-    mutate(spec_tag = tag)
-}) %>%
-  left_join(disease_labels, by = "icd103c") %>%
-  mutate(odds_ratio = exp(estimate), or_low = exp(conf.low), or_high = exp(conf.high))
-
-cat("\n[13] Lagged exposures, selected (cholera A00, polio A80, J09):\n")
-print(as.data.frame(
-  results_lag %>%
-    filter(icd103c %in% c("A00", "A80", "J09"),
-           str_detect(term, "minor|war|intrastate")) %>%
-    arrange(icd103c, spec_tag, term) %>%
-    dplyr::select(icd103c, icd103n, spec_tag, term,
-                  odds_ratio, or_low, or_high, p.value, n_obs, n_countries)))
-write_csv(results_lag, file.path(out_dir, "logit_lagged.csv"))
+panel_ctrl <- panel %>%
+  left_join(wdi, by = c("iso3", "year")) %>%
+  mutate(complete_ctrl = if_all(all_of(CTRL), ~ !is.na(.)))
+stopifnot(nrow(panel_ctrl) == nrow(panel))
 
 
-# =============================================================================
-# 14. WHO-region-by-year fixed effects (regional-shock confounding) -----------
-results_ry_type <- map_dfr(top_diseases$icd103c, run_disease_logit,
-                           exposure = "conflict_type", data = panel_ctrl,
-                           extra_covars = c("log_pop", "log_gdp_pc", "urban_pct"),
-                           fe = "iso3 + who_region^year") %>%
-  left_join(disease_labels, by = "icd103c") %>%
-  mutate(odds_ratio = exp(estimate), or_low = exp(conf.low), or_high = exp(conf.high))
+# 6. Descriptive statistics ---------------------------------------------------
+describe_by <- function(by) panel %>%
+  group_by(.data[[by]]) %>%
+  summarise(country_years = n(), pct_panel = 100 * n() / nrow(panel),
+            pct_any_outbreak = 100 * mean(any_outbreak), mean_outbreaks = mean(n_outbreaks),
+            .groups = "drop")
+desc_type      <- describe_by("conflict_type")
+desc_intensity <- describe_by("intensity")
+write_csv(desc_type,               file.path(out_dir, "table1_by_type.csv"))
+write_csv(desc_intensity,          file.path(out_dir, "table1_by_intensity.csv"))
+write_csv(describe_by("duration"), file.path(out_dir, "table1_by_duration.csv"))
 
-results_ry_int <- map_dfr(top_diseases$icd103c, run_disease_logit,
-                          exposure = "intensity", data = panel_ctrl,
-                          extra_covars = c("log_pop", "log_gdp_pc", "urban_pct"),
-                          fe = "iso3 + who_region^year") %>%
-  left_join(disease_labels, by = "icd103c") %>%
-  mutate(odds_ratio = exp(estimate), or_low = exp(conf.low), or_high = exp(conf.high))
+outbreak_with_conflict <- who_cyd %>%
+  inner_join(panel %>% select(iso3, year, conflict_type, intensity, any_conflict),
+             by = c("iso3", "year"))
 
-cat("\n[14] Region-by-year FE, type (polio A80, cholera A00, J09):\n")
-print(as.data.frame(
-  results_ry_type %>%
-    filter(icd103c %in% c("A80", "A00", "J09"), str_detect(term, "intrastate")) %>%
-    dplyr::select(icd103c, icd103n, term, odds_ratio, or_low, or_high, p.value,
-                  n_obs, n_countries)))
-cat("\n[14] Region-by-year FE, intensity (polio A80, cholera A00, J09):\n")
-print(as.data.frame(
-  results_ry_int %>%
-    filter(icd103c %in% c("A80", "A00", "J09"), str_detect(term, "minor|war")) %>%
-    dplyr::select(icd103c, icd103n, term, odds_ratio, or_low, or_high, p.value,
-                  n_obs, n_countries)))
-write_csv(results_ry_type, file.path(out_dir, "logit_region_by_year_type.csv"))
-write_csv(results_ry_int,  file.path(out_dir, "logit_region_by_year_intensity.csv"))
+# the source file has two labels for U04 (SARS and MERS), so use one
+disease_labels <- outbreak_with_conflict %>% group_by(icd103c) %>%
+  summarise(icd103n = first(icd103n), .groups = "drop") %>%
+  mutate(icd103n = if_else(icd103c == "U04", "SARS and MERS", icd103n))
+top_diseases <- outbreak_with_conflict %>% count(icd103c) %>%
+  arrange(desc(n), icd103c) %>% slice_head(n = 20) %>%
+  left_join(disease_labels, by = "icd103c")
+
+disease_list <- outbreak_with_conflict %>%
+  group_by(icd103c) %>%
+  summarise(icd103n = first(icd103n), country_years = n(), countries = n_distinct(iso3),
+            first_year = min(year), last_year = max(year),
+            pct_in_conflict = round(100 * mean(any_conflict == 1L), 1), .groups = "drop") %>%
+  mutate(analysed = icd103c %in% top_diseases$icd103c) %>%
+  arrange(desc(country_years))
+write_csv(disease_list, file.path(out_dir, "disease_list.csv"))
+
+# conflict type x disease; descriptive only, since outbreaks cluster within countries
+xtab <- outbreak_with_conflict %>%
+  filter(icd103c %in% top_diseases$icd103c) %>%
+  count(conflict_type, icd103c) %>%
+  pivot_wider(names_from = icd103c, values_from = n, values_fill = 0)
+mat <- as.matrix(xtab[, -1]); rownames(mat) <- xtab$conflict_type
+chi_res <- chisq.test(mat, simulate.p.value = TRUE, B = 10000)
+print(chi_res)
+write_csv(as.data.frame(chi_res$stdres) %>%
+            rownames_to_column("conflict_type") %>%
+            pivot_longer(-conflict_type, names_to = "icd103c", values_to = "stdres") %>%
+            left_join(disease_labels, by = "icd103c"),
+          file.path(out_dir, "chi2_residuals.csv"))
 
 
-# =============================================================================
-# 15. Foreign-intervention indicator, collinearity, Cramer's V, Poisson -------
-# Guarded: UCDP second-party columns are named side_a_2nd / side_b_2nd in
-# v25.1; if your file differs, set the two names below and the block adapts.
-fi_cols <- c("side_a_2nd", "side_b_2nd")
-if (all(fi_cols %in% names(ucdp_long))) {
-  fi_cy <- ucdp_long %>%
-    mutate(foreign = as.integer(
-      (!is.na(.data[[fi_cols[1]]]) & str_trim(as.character(.data[[fi_cols[1]]])) != "") |
-      (!is.na(.data[[fi_cols[2]]]) & str_trim(as.character(.data[[fi_cols[2]]])) != ""))) %>%
-    group_by(iso3, year) %>%
-    summarise(foreign_intervention = as.integer(any(foreign == 1L)), .groups = "drop")
+# 7. Model functions ----------------------------------------------------------
+primary_logit_samples <- new.env()   # samples of the main logits, reused for the matched LPM
 
-  panel_fi <- panel_ctrl %>%
-    left_join(fi_cy, by = c("iso3", "year")) %>%
-    mutate(foreign_intervention = replace_na(foreign_intervention, 0L))
-
-  # Within-country (country-demeaned) correlation: foreign intervention vs
-  # the internationalised-intrastate type indicator.
-  wc <- panel_fi %>%
-    group_by(iso3) %>%
-    mutate(fi_dm  = foreign_intervention - mean(foreign_intervention),
-           iii_dm = has_intl_intra       - mean(has_intl_intra)) %>%
-    ungroup()
-  r_within <- cor(wc$fi_dm, wc$iii_dm, use = "complete.obs")
-  cat(sprintf("\n[15] Within-country correlation (foreign intervention vs internationalised intrastate): r = %.3f\n",
-              r_within))
-} else {
-  cat("\n[15] side_a_2nd / side_b_2nd not found in ucdp_long; skipping foreign-intervention diagnostic.\n")
-  cat("     Set fi_cols to the correct column names to enable it.\n")
+# Fixed-effects logit (or LPM) for one disease. Non-converged models are dropped.
+# A cell is flagged as sparse if it has fewer than 3 exposed events or an unstable estimate.
+run_disease_logit <- function(disease_code, exposure = "conflict_type", data = panel_ctrl,
+                              extra_covars = CTRL, fe = "iso3 + year", y_var = NULL,
+                              model = "logit", extra_terms = NULL, keep_sample = FALSE) {
+  d <- if (is.null(y_var)) {
+    data %>%
+      left_join(who_cyd %>% filter(icd103c == disease_code) %>%
+                  distinct(iso3, year) %>% mutate(y = 1L), by = c("iso3", "year")) %>%
+      mutate(y = replace_na(y, 0L))
+  } else mutate(data, y = .data[[y_var]])
+  d <- d %>% filter(!is.na(y), !is.na(.data[[exposure]]))
+  if (length(extra_covars)) d <- d %>% filter(if_all(all_of(extra_covars), ~ !is.na(.)))
+  
+  f <- as.formula(paste("y ~", paste(c(exposure, extra_terms, extra_covars), collapse = " + "),
+                        "|", fe))
+  fit_note <- NA_character_
+  mod <- withCallingHandlers(
+    tryCatch(if (model == "lpm") feols(f, data = d, cluster = ~iso3)
+             else feglm(f, data = d, family = binomial(), cluster = ~iso3),
+             error = function(e) { fit_note <<- conditionMessage(e); NULL }),
+    warning = function(w) {
+      fit_note <<- paste(na.omit(c(fit_note, conditionMessage(w))), collapse = " | ")
+      invokeRestart("muffleWarning")
+    })
+  if (!is.null(mod) && isFALSE(mod$convStatus)) {
+    fit_note <- paste(na.omit(c(fit_note, "not converged")), collapse = " | ")
+    mod <- NULL
+  }
+  
+  base <- tibble(icd103c = disease_code, exposure = exposure, fe = fe, model = model,
+                 controls = if (length(extra_covars)) paste(extra_covars, collapse = "+") else "none",
+                 extra_terms = if (length(extra_terms)) paste(extra_terms, collapse = "+") else "none")
+  if (is.null(mod)) return(mutate(base, term = NA_character_, fit_note = fit_note))
+  
+  used <- d[fixest::obs(mod), , drop = FALSE]
+  if (keep_sample)
+    primary_logit_samples[[paste(disease_code, exposure, sep = "__")]] <-
+    used %>% select(iso3, year) %>% distinct()
+  expo <- as.character(used[[exposure]])
+  td   <- tidy(mod, conf.int = TRUE)
+  td$level <- ifelse(str_starts(td$term, fixed(exposure)),
+                     str_remove(td$term, fixed(exposure)), NA_character_)
+  td$events_exposed <- vapply(td$level, function(l)
+    if (is.na(l)) NA_integer_ else as.integer(sum(used$y[expo == l])), integer(1))
+  td$countries_with_exposed_event <- vapply(td$level, function(l)
+    if (is.na(l)) NA_integer_ else as.integer(n_distinct(used$iso3[expo == l & used$y == 1L])), integer(1))
+  logit <- model == "logit"
+  
+  bind_cols(base[rep(1, nrow(td)), ], td) %>%
+    mutate(n_obs = as.integer(mod$nobs),
+           n_countries = as.integer(mod$fixef_sizes[["iso3"]]),
+           n_switching = sum(tapply(expo, used$iso3, function(z) n_distinct(z) > 1)),
+           n_events = as.integer(sum(used$y)),
+           fit_note = fit_note,
+           collinear_terms = if (length(mod$collin.var)) paste(mod$collin.var, collapse = "; ") else NA_character_,
+           sparse = !is.na(level) & (events_exposed < 3 |
+                                       (logit & (abs(estimate) > 8 | std.error > 5))),
+           odds_ratio = if (logit) exp(estimate)  else NA_real_,
+           or_low     = if (logit) exp(conf.low)  else NA_real_,
+           or_high    = if (logit) exp(conf.high) else NA_real_)
 }
 
-# Cramer's V for type x intensity among conflict-active country-years.
-ti <- panel %>% filter(any_conflict == 1L) %>%
-  mutate(conflict_type = droplevels(conflict_type),
-         intensity     = droplevels(intensity))
-tab_ti <- table(ti$conflict_type, ti$intensity)
-chi_ti <- suppressWarnings(chisq.test(tab_ti))
-cramers_v <- sqrt(as.numeric(chi_ti$statistic) /
-                  (sum(tab_ti) * (min(dim(tab_ti)) - 1)))
-cat(sprintf("[15] Cramer's V (type x intensity, conflict-active country-years) = %.3f\n",
-            cramers_v))
+fit_all <- function(codes, ...) map_dfr(codes, run_disease_logit, ...) %>%
+  left_join(disease_labels, by = "icd103c")
+is_expo <- function(df, pattern) !is.na(df$term) & str_detect(df$term, pattern)
 
-# Poisson sensitivity for the controlled total-count model (type).
-pois_type <- tryCatch(
-  fepois(n_outbreaks ~ conflict_type + log_pop + log_gdp_pc + urban_pct | iso3 + year,
-         data = panel_ctrl, cluster = ~iso3),
-  error = function(e) { cat("Poisson (type) failed:", conditionMessage(e), "\n"); NULL })
-if (!is.null(pois_type)) { cat("\n[15] Poisson sensitivity, controlled type:\n"); print(summary(pois_type)) }
+# negative binomial model for the number of reported disease categories
+fit_nb <- function(exposure, ctrl = CTRL, data = panel_ctrl, fe = "iso3 + year") {
+  f <- as.formula(paste("n_outbreaks ~", paste(c(exposure, ctrl), collapse = " + "), "|", fe))
+  mod <- tryCatch(suppressWarnings(fenegbin(f, data = data, cluster = ~iso3)), error = function(e) NULL)
+  if (is.null(mod) || isFALSE(mod$convStatus)) return(NULL)
+  tidy(mod, conf.int = TRUE) %>%
+    filter(str_starts(term, exposure)) %>%
+    mutate(exposure = exposure, controls = paste(ctrl, collapse = "+"), fe = fe, n_obs = mod$nobs,
+           irr = exp(estimate), irr_low = exp(conf.low), irr_high = exp(conf.high))
+}
 
 
-# =============================================================================
-# 16. Benjamini-Hochberg FDR across disease-specific tests --------------------
-fdr_in <- bind_rows(
-  results_logit_ctrl     %>% filter(str_detect(term, "conflict_type")) %>% mutate(block = "type"),
-  results_logit_int_ctrl %>% filter(str_detect(term, "intensity"))     %>% mutate(block = "intensity")
+# 8. Main models --------------------------------------------------------------
+top <- top_diseases$icd103c
+
+res_type      <- fit_all(top, exposure = "conflict_type", keep_sample = TRUE)
+res_intensity <- fit_all(top, exposure = "intensity", keep_sample = TRUE)
+res_nocontrol <- bind_rows(fit_all(top, exposure = "conflict_type", extra_covars = NULL),
+                           fit_all(top, exposure = "intensity",     extra_covars = NULL))
+res_count     <- bind_rows(map_dfr(c("conflict_type", "intensity", "duration", "intensity_duration"), fit_nb),
+                           map_dfr(c("conflict_type", "intensity"), fit_nb, ctrl = character(0)),
+                           map_dfr(c("conflict_type", "intensity"), fit_nb, fe = "iso3 + who_region^year"))
+# no controls, but on the same complete-case sample as the adjusted models
+res_same_sample <- bind_rows(
+  fit_all(top, exposure = "conflict_type", extra_covars = NULL, data = filter(panel_ctrl, complete_ctrl)),
+  fit_all(top, exposure = "intensity",     extra_covars = NULL, data = filter(panel_ctrl, complete_ctrl)))
+
+write_csv(res_type,        file.path(out_dir, "logit_type.csv"))
+write_csv(res_intensity,   file.path(out_dir, "logit_intensity.csv"))
+write_csv(res_nocontrol,   file.path(out_dir, "logit_no_controls.csv"))
+write_csv(res_same_sample, file.path(out_dir, "logit_no_controls_complete_cases.csv"))
+write_csv(res_count,       file.path(out_dir, "negbin_count.csv"))
+
+# Poisson check of the count model
+pois <- fepois(n_outbreaks ~ conflict_type + log_pop + log_gdp_pc + urban_pct | iso3 + year,
+               data = panel_ctrl, cluster = ~iso3)
+write_csv(tidy(pois, conf.int = TRUE), file.path(out_dir, "poisson_count.csv"))
+
+
+# 9. Lagged exposures and region-by-year fixed effects ------------------------
+res_lag <- map_dfr(c("intensity_lag1", "intensity_lag2", "conflict_type_lag1", "conflict_type_lag2"),
+                   ~ fit_all(top, exposure = .x))
+# lagged exposure with current intensity in the model, since conflict persists
+res_lag_cond <- map_dfr(c("intensity_lag1", "intensity_lag2"),
+                        ~ fit_all(c(HEADLINE, EXTRA_DIS), exposure = .x, extra_terms = "intensity"))
+res_region <- bind_rows(fit_all(top, exposure = "conflict_type", fe = "iso3 + who_region^year"),
+                        fit_all(top, exposure = "intensity",     fe = "iso3 + who_region^year"))
+
+write_csv(res_lag,      file.path(out_dir, "logit_lagged.csv"))
+write_csv(res_lag_cond, file.path(out_dir, "logit_lagged_given_current.csv"))
+write_csv(res_region,   file.path(out_dir, "logit_region_by_year.csv"))
+
+
+# 10. False discovery rate ----------------------------------------------------
+# Primary family: same-year type and intensity contrasts, leaving out interstate
+# (31 country-years), sparse cells and plague (quasi-separated).
+# Second family adds the one- and two-year lags.
+fdr <- bind_rows(
+  res_type      %>% filter(is_expo(., "^conflict_type")) %>% mutate(lag = 0L),
+  res_intensity %>% filter(is_expo(., "^intensity"))     %>% mutate(lag = 0L),
+  res_lag       %>% filter(is_expo(., "_lag"))           %>% mutate(lag = as.integer(str_sub(exposure, -1)))
 ) %>%
-  dplyr::select(block, icd103c, icd103n, term, odds_ratio, or_low, or_high,
-                p.value, n_obs, n_countries)
+  select(icd103c, icd103n, exposure, lag, term, odds_ratio, or_low, or_high, p.value,
+         n_countries, n_switching, events_exposed, sparse) %>%
+  mutate(eligible  = !str_detect(term, "interstate|extrasystemic") & !sparse & is.finite(p.value) & icd103c != "A20",
+         q_primary = NA_real_, q_with_lags = NA_real_, q_planned = NA_real_)
+prim <- fdr$eligible & fdr$lag == 0
+fdr$q_primary[prim]           <- p.adjust(fdr$p.value[prim], "BH")
+fdr$q_planned[prim]           <- p.adjust(fdr$p.value[prim], "BH", n = max(sum(prim), 4 * length(top)))
+fdr$q_with_lags[fdr$eligible] <- p.adjust(fdr$p.value[fdr$eligible], "BH")
+write_csv(arrange(fdr, q_primary), file.path(out_dir, "fdr.csv"))
+write_csv(filter(fdr, !is.na(q_with_lags), q_with_lags < 0.05) %>% arrange(q_with_lags),
+          file.path(out_dir, "fdr_significant_with_lags.csv"))
 
-fdr_out <- fdr_in %>%
-  mutate(q_value = p.adjust(p.value, method = "BH")) %>%
-  arrange(q_value)
 
-cat("\n[16] Benjamini-Hochberg FDR across disease-specific tests (type + intensity):\n")
-print(as.data.frame(fdr_out))
-cat(sprintf("[16] Associations surviving FDR q < 0.05: %d of %d\n",
-            sum(fdr_out$q_value < 0.05, na.rm = TRUE), nrow(fdr_out)))
-write_csv(fdr_out, file.path(out_dir, "fdr_disease_specific.csv"))
+# 11. Sensitivity analyses ----------------------------------------------------
+key   <- unique(c(HEADLINE, EXTRA_DIS))
+expo2 <- c("conflict_type", "intensity")
+sens <- bind_rows(
+  map_dfr(expo2, ~ fit_all(key, exposure = .x, extra_covars = CTRL_LAG)) %>% mutate(analysis = "lagged controls"),
+  map_dfr(expo2, ~ fit_all(key, exposure = .x, data = filter(panel_ctrl, !year %in% 2020:2022))) %>%
+    mutate(analysis = "excluding 2020-22"),
+  map_dfr(expo2, ~ fit_all(key, exposure = .x, model = "lpm")) %>% mutate(analysis = "linear probability model")
+)
+write_csv(sens, file.path(out_dir, "sensitivity.csv"))
+
+# LPM on exactly the same country-years as each main logit
+lpm_matched <- map_dfr(expo2, function(ex) map_dfr(key, function(cd) {
+  keys <- primary_logit_samples[[paste(cd, ex, sep = "__")]]
+  d <- semi_join(panel_ctrl, keys, by = c("iso3", "year"))
+  r <- run_disease_logit(cd, exposure = ex, data = d, model = "lpm")
+  stopifnot(all(r$n_obs == nrow(keys)))
+  mutate(r, analysis = "linear probability model, primary logit sample")
+})) %>% left_join(disease_labels, by = "icd103c")
+write_csv(lpm_matched, file.path(out_dir, "lpm_matched_logit_sample.csv"))
+
+# J09 influenza without the 2009-10 pandemic, and without the five main notifiers
+top_flu <- who_cyd %>% filter(icd103c == "J09") %>% count(iso3, sort = TRUE) %>% slice_head(n = 5) %>% pull(iso3)
+res_j09 <- bind_rows(
+  map_dfr(c(expo2, "intensity_lag2"), ~ fit_all("J09", exposure = .x)) %>% mutate(subset = "full"),
+  map_dfr(expo2, ~ fit_all("J09", exposure = .x, data = filter(panel_ctrl, !year %in% 2009:2010))) %>%
+    mutate(subset = "excluding 2009-10"),
+  map_dfr(expo2, ~ fit_all("J09", exposure = .x, data = filter(panel_ctrl, !iso3 %in% top_flu))) %>%
+    mutate(subset = paste("excluding", paste(top_flu, collapse = ", ")))
+)
+write_csv(res_j09, file.path(out_dir, "j09_influenza.csv"))
 
 
-# =============================================================================
-# 17. Pairs cluster bootstrap for headline diseases ---------------------------
-# Resamples countries with replacement, assigns a fresh id per draw to preserve
-# cluster independence, refits the FE logit, and forms a null-centred bootstrap
-# p-value and percentile CI. Guards against anticonservative cluster-robust SEs
-# under rare events with a moderate number of clusters.
-cluster_boot_logit <- function(disease_code, exposure = "conflict_type",
-                               covars = c("log_pop", "log_gdp_pc", "urban_pct"),
-                               fe = "iso3 + year", data = panel_ctrl,
-                               B = 499, seed = 1) {
-  set.seed(seed)
-  d <- data %>%
-    left_join(who_cyd %>% filter(icd103c == disease_code) %>%
-                mutate(this_outbreak = 1L) %>%
-                dplyr::select(iso3, year, this_outbreak),
+# 12. Newly reported categories -----------------------------------------------
+# 1 if reported this year but not last year; country-years already reported
+# last year (and each country's first year) are left out.
+for (cd in key) {
+  y_now <- paste0("y_", cd); y_new <- paste0("new_", cd)
+  panel_ctrl <- panel_ctrl %>%
+    left_join(who_cyd %>% filter(icd103c == cd) %>% distinct(iso3, year) %>% mutate(!!y_now := 1L),
               by = c("iso3", "year")) %>%
-    mutate(this_outbreak = replace_na(this_outbreak, 0L))
-  rhs <- paste(c(exposure, covars), collapse = " + ")
-  f <- as.formula(paste0("this_outbreak ~ ", rhs, " | ", fe))
-  obs <- tryCatch(feglm(f, data = d, family = binomial(), cluster = ~iso3),
-                  error = function(e) NULL, warning = function(w) NULL)
-  if (is.null(obs)) return(NULL)
-  obs_co <- coef(obs)
-  terms  <- names(obs_co)[str_detect(names(obs_co), exposure)]
-  if (length(terms) == 0) return(NULL)
-  clusters <- unique(d$iso3)
-  bt <- matrix(NA_real_, nrow = B, ncol = length(terms), dimnames = list(NULL, terms))
-  for (b in seq_len(B)) {
-    samp <- sample(clusters, length(clusters), replace = TRUE)
-    db <- bind_rows(lapply(seq_along(samp), function(i) {
-      x <- d[d$iso3 == samp[i], , drop = FALSE]
-      x$iso3 <- paste0(samp[i], "__", i)   # fresh id => independent pseudo-cluster
-      x
-    }))
-    mb <- tryCatch(feglm(f, data = db, family = binomial(), cluster = ~iso3),
-                   error = function(e) NULL, warning = function(w) NULL)
-    if (!is.null(mb)) {
-      cb <- coef(mb)
-      for (tm in terms) if (tm %in% names(cb)) bt[b, tm] <- cb[tm]
-    }
+    mutate(!!y_now := replace_na(.data[[y_now]], 0L)) %>%
+    arrange(iso3, year) %>%
+    group_by(iso3) %>%
+    mutate(!!y_new := if_else(year - lag(year) == 1L & lag(.data[[y_now]]) == 0L,
+                              .data[[y_now]], NA_integer_)) %>%
+    ungroup()
+}
+res_new <- map_dfr(c(expo2, "intensity_lag2"), function(ex)
+  map_dfr(key, ~ run_disease_logit(.x, exposure = ex, y_var = paste0("new_", .x)))) %>%
+  left_join(disease_labels, by = "icd103c")
+write_csv(res_new, file.path(out_dir, "logit_new_reports.csv"))
+
+
+# 13. Conflict duration -------------------------------------------------------
+res_duration <- map_dfr(c("duration", "intensity_duration"), ~ fit_all(key, exposure = .x))
+write_csv(res_duration, file.path(out_dir, "logit_duration.csv"))
+
+
+# 14. Measles and polio -------------------------------------------------------
+# the data do not separate wild from vaccine-derived polio, so we drop the
+# wild-polio endemic countries instead
+res_polio_measles <- bind_rows(
+  map_dfr(expo2, ~ fit_all("B05", exposure = .x)) %>% mutate(analysis = "measles"),
+  map_dfr(expo2, ~ fit_all("A80", exposure = .x, data = filter(panel_ctrl, !iso3 %in% WPV_ENDEMIC))) %>%
+    mutate(analysis = "polio, excluding WPV-endemic countries")
+)
+write_csv(res_polio_measles, file.path(out_dir, "measles_polio.csv"))
+
+
+# 15. Country bootstrap -------------------------------------------------------
+# Resample countries with replacement (repeated countries get new IDs), refit,
+# and take the 2.5% and 97.5% percentiles of the log odds ratios.
+# Draws with |log OR| >= 8 are kept but counted.
+cluster_boot <- function(code, exposure, B = B_BOOT, seed = BOOT_SEED) {
+  set.seed(seed)
+  d <- panel_ctrl %>%
+    left_join(who_cyd %>% filter(icd103c == code) %>% distinct(iso3, year) %>% mutate(y = 1L),
+              by = c("iso3", "year")) %>%
+    mutate(y = replace_na(y, 0L)) %>%
+    filter(if_all(all_of(c(exposure, CTRL)), ~ !is.na(.))) %>%
+    group_by(iso3) %>% filter(n_distinct(y) > 1L) %>% ungroup()
+  f <- as.formula(paste("y ~", paste(c(exposure, CTRL), collapse = " + "), "| iso3 + year"))
+  
+  fit <- function(x, vc) {
+    m <- tryCatch(suppressWarnings(feglm(f, data = x, family = binomial(), vcov = vc, lean = TRUE)),
+                  error = function(e) NULL)
+    if (is.null(m) || isFALSE(m$convStatus)) NULL else coef(m)
   }
-  purrr::map_dfr(terms, function(tm) {
-    v <- bt[, tm]; v <- v[is.finite(v)]
-    ci <- stats::quantile(v, c(0.025, 0.975), na.rm = TRUE)
-    tibble(icd103c = disease_code, exposure = exposure, term = tm,
-           odds_ratio  = exp(unname(obs_co[tm])),
-           boot_or_low = exp(unname(ci[1])), boot_or_high = exp(unname(ci[2])),
-           p_boot = mean(abs(v - obs_co[tm]) >= abs(obs_co[tm])),
-           n_boot = length(v))
+  
+  b0 <- fit(d, ~iso3)
+  if (is.null(b0)) stop("Bootstrap baseline model failed for ", code, " / ", exposure)
+  terms <- names(b0)[str_starts(names(b0), fixed(exposure)) &
+                       !str_detect(names(b0), "interstate|extrasystemic")]
+  
+  rows    <- split(seq_len(nrow(d)), d$iso3)
+  samples <- replicate(B, sample(names(rows), length(rows), replace = TRUE), simplify = FALSE)
+  draws <- do.call(rbind, lapply(samples, function(s) {
+    idx <- rows[s]
+    db  <- d[unlist(idx, use.names = FALSE), ]
+    db$iso3 <- rep(paste0(s, "_", seq_along(s)), lengths(idx))
+    b <- fit(db, "iid")
+    if (is.null(b)) rep(NA_real_, length(terms)) else unname(b[terms])
+  }))
+  
+  map_dfr(seq_along(terms), function(j) {
+    v <- draws[, j]
+    v <- v[is.finite(v)]
+    tibble(icd103c = code, exposure = exposure, term = terms[j],
+           odds_ratio = exp(b0[[terms[j]]]),
+           boot_low  = exp(quantile(v, 0.025, names = FALSE)),
+           boot_high = exp(quantile(v, 0.975, names = FALSE)),
+           replicates_ok = length(v), replicates_failed = B - length(v),
+           replicates_extreme = sum(abs(v) >= 8))
   })
 }
 
-boot_headline <- bind_rows(
-  cluster_boot_logit("A80", "conflict_type"),
-  cluster_boot_logit("A98", "conflict_type"),
-  cluster_boot_logit("A00", "intensity_lag2"),
-  cluster_boot_logit("J09", "conflict_type")
-) %>% left_join(disease_labels, by = "icd103c")
-cat("\n[17] Pairs cluster bootstrap (B = 499), headline diseases:\n")
-print(as.data.frame(boot_headline))
-write_csv(boot_headline, file.path(out_dir, "cluster_bootstrap_headline.csv"))
+boot_specs <- tribble(
+  ~code, ~exposure,
+  "A80", "conflict_type", "A80", "intensity",
+  "A98", "conflict_type", "A98", "intensity",
+  "A00", "intensity_lag1", "A00", "intensity_lag2",
+  "J09", "conflict_type", "J09", "intensity")
+
+res_boot <- pmap_dfr(boot_specs, function(code, exposure) {
+  message("Bootstrap: ", code, " ~ ", exposure)
+  cluster_boot(code, exposure)
+}) %>% left_join(disease_labels, by = "icd103c")
+write_csv(res_boot, file.path(out_dir, "bootstrap.csv"))
 
 
-# =============================================================================
-# 18. J09 negative-control validity checks ------------------------------------
-# Is the J09 deficit driven by where influenza is notified (peaceful, high-
-# surveillance settings) rather than by surveillance erosion in conflict?
-# Re-estimate excluding (a) the 2009-10 A(H1N1) window and (b) the principal
-# influenza-notifying countries. The deficit (OR < 1) persisting supports the
-# surveillance-erosion reading.
-j09_reporters <- who_cyd %>% filter(icd103c == "J09") %>% count(iso3, sort = TRUE)
-cat("\n[18] Top J09-notifying countries:\n"); print(as.data.frame(head(j09_reporters, 8)))
-top_flu <- head(j09_reporters$iso3, 5)
-
-ctrl3 <- c("log_pop", "log_gdp_pc", "urban_pct")
-nc_all <- bind_rows(
-  run_disease_logit("J09", "conflict_type", panel_ctrl, ctrl3) %>% mutate(subset = "full"),
-  run_disease_logit("J09", "intensity",     panel_ctrl, ctrl3) %>% mutate(subset = "full"),
-  run_disease_logit("J09", "conflict_type", panel_ctrl %>% filter(!year %in% 2009:2010), ctrl3) %>% mutate(subset = "excl_2009_2010"),
-  run_disease_logit("J09", "intensity",     panel_ctrl %>% filter(!year %in% 2009:2010), ctrl3) %>% mutate(subset = "excl_2009_2010"),
-  run_disease_logit("J09", "conflict_type", panel_ctrl %>% filter(!iso3 %in% top_flu), ctrl3) %>% mutate(subset = "excl_top_flu_reporters"),
-  run_disease_logit("J09", "intensity",     panel_ctrl %>% filter(!iso3 %in% top_flu), ctrl3) %>% mutate(subset = "excl_top_flu_reporters")
-) %>%
-  filter(str_detect(term, "intrastate|minor|war")) %>%
-  mutate(odds_ratio = exp(estimate), or_low = exp(conf.low), or_high = exp(conf.high)) %>%
-  dplyr::select(subset, spec, term, odds_ratio, or_low, or_high, p.value, n_obs, n_countries)
-
-cat("\n[18] J09 negative-control validity (deficit persists if ORs stay < 1):\n")
-print(as.data.frame(nc_all))
-write_csv(nc_all, file.path(out_dir, "j09_negative_control_validity.csv"))
-
-
-# =============================================================================
-# 19. Sample-flow reconciliation (6,844 frame -> analytic N) ------------------
-n_frame     <- nrow(panel)
-n_type_used <- tryCatch(results_logit_ctrl$n_obs[results_logit_ctrl$icd103c == "A80"][1],
-                        error = function(e) NA_integer_)
+# 16. Other descriptives ------------------------------------------------------
 flow <- tibble(
-  stage = c("Full country-year frame (236 x 29)",
-            "With any WDI covariate present",
-            "With all three controls complete (log_pop, log_gdp_pc, urban_pct)",
-            "Controlled negative binomial (type) N",
-            "Example per-disease FE logit (A80, controlled type) N used"),
-  n = c(n_frame,
-        panel_ctrl %>% filter(if_any(c(log_pop, log_gdp_pc, urban_pct), ~ !is.na(.))) %>% nrow(),
-        panel_ctrl %>% filter(!is.na(log_pop), !is.na(log_gdp_pc), !is.na(urban_pct)) %>% nrow(),
-        tryCatch(as.integer(nb_mod_ctrl_type$nobs), error = function(e) NA_integer_),
-        n_type_used)
-)
-cat("\n[19] Sample-flow reconciliation (map these to 6,844 / 6,496 / 5,451):\n")
-print(as.data.frame(flow))
+  stage = c("Units x years", "Excluding non-existent country-years",
+            "Complete controls", "Countries"),
+  n = c(nrow(frame), nrow(panel), sum(panel_ctrl$complete_ctrl), n_distinct(panel$iso3)))
 write_csv(flow, file.path(out_dir, "sample_flow.csv"))
 
+write_csv(panel_ctrl %>%
+            group_by(controls = if_else(complete_ctrl, "complete", "missing")) %>%
+            summarise(country_years = n(), countries = n_distinct(iso3),
+                      pct_conflict = 100 * mean(any_conflict), pct_war = 100 * mean(war),
+                      pct_any_outbreak = 100 * mean(any_outbreak), .groups = "drop"),
+          file.path(out_dir, "missing_controls_comparison.csv"))
 
-# =============================================================================
-# 20. Figure 1: forest plot (single panel, disease labels at right) -----------
-# Drop-in for section 20. Reuses results_logit_ctrl, results_logit_int_ctrl,
-# results_lag, results_ry_type, results_ry_int. Needs ggplot2 + scales only.
+# foreign intervention vs internationalised intrastate, within countries
+fi <- ucdp_long %>%
+  mutate(foreign = (!is.na(side_a_2nd) & str_trim(side_a_2nd) != "") |
+           (!is.na(side_b_2nd) & str_trim(side_b_2nd) != "")) %>%
+  group_by(iso3, year) %>% summarise(fi = as.integer(any(foreign)), .groups = "drop")
+wc <- panel %>% left_join(fi, by = c("iso3", "year")) %>% mutate(fi = replace_na(fi, 0L)) %>%
+  group_by(iso3) %>% mutate(fi = fi - mean(fi), ii = has_intl_intra - mean(has_intl_intra)) %>% ungroup()
+fi_correlation <- cor(wc$fi, wc$ii)
+tab_ti <- with(filter(panel, any_conflict == 1L), table(droplevels(conflict_type), droplevels(intensity)))
+cramers_v <- sqrt(suppressWarnings(chisq.test(tab_ti))$statistic / (sum(tab_ti) * (min(dim(tab_ti)) - 1)))
+write_csv(tibble(diagnostic = c("Within-country r, foreign intervention vs internationalised intrastate",
+                                "Cramer's V, conflict type x intensity"),
+                 value = c(fi_correlation, unname(cramers_v))),
+          file.path(out_dir, "diagnostics.csv"))
 
-library(ggplot2); library(scales); library(dplyr); library(stringr)
-library(tibble); library(purrr); library(tidyr)
+# multinomial logit among reported categories; descriptive, two reference categories
+mn_data <- outbreak_with_conflict %>% filter(icd103c %in% top) %>%
+  mutate(icd103c = factor(icd103c), conflict_type = droplevels(conflict_type))
+mn_run <- function(ref) {
+  m <- multinom(icd103c ~ conflict_type, data = mutate(mn_data, icd103c = relevel(icd103c, ref)),
+                trace = FALSE, maxit = 1000)
+  as.data.frame(as.table(coef(m))) %>%
+    rename(icd103c = Var1, term = Var2, estimate = Freq) %>%
+    mutate(relative_odds = exp(estimate), reference = ref, converged = m$convergence == 0)
+}
+write_csv(bind_rows(mn_run(top[1]), mn_run(setdiff(top, "J09")[1])),
+          file.path(out_dir, "multinomial.csv"))
 
-get_or <- function(df, code, term_regex) {
-  r <- df %>% filter(icd103c == code, str_detect(term, term_regex))
-  if (nrow(r) == 0) return(tibble(odds_ratio = NA_real_, or_low = NA_real_, or_high = NA_real_))
-  r %>% slice(1) %>% dplyr::select(odds_ratio, or_low, or_high)
+write_csv(who_covid %>% rename(year = Year) %>%
+            left_join(select(panel, iso3, year, conflict_type), by = c("iso3", "year")) %>%
+            count(year, conflict_type),
+          file.path(out_dir, "covid_by_conflict_type.csv"))
+
+
+# 17. Figure 1: disease profile by conflict type -----------------------------
+make_fig1 <- function(fig1_df, den) {
+  cols   <- c(none = "#8C8C8C", intrastate = "#0072B2", internationalised_intrastate = "#D55E00")
+  shapes <- c(none = 16, intrastate = 15, internationalised_intrastate = 17)
+  labs_base <- c(none = "No conflict baseline", intrastate = "Intrastate conflict",
+                 internationalised_intrastate = "Internationalised intrastate conflict")
+  leg_labels <- setNames(
+    paste0(labs_base[names(cols)], " (n = ", scales::comma(den[names(cols)]), ")"), names(cols))
+  
+  # one row per disease, ordered so the biggest rise in conflict is at the top
+  d_wide <- fig1_df %>%
+    filter(conflict_type %in% names(cols)) %>%
+    complete(nesting(icd103c, label), conflict_type = names(cols), fill = list(share = 0)) %>%
+    pivot_wider(names_from = conflict_type, values_from = share) %>%
+    mutate(shift = pmax(intrastate - none, internationalised_intrastate - none, na.rm = TRUE),
+           label_wrapped = stringr::str_wrap(label, width = 38)) %>%
+    arrange(shift)
+  labels_ordered <- d_wide$label_wrapped
+  d_wide <- d_wide %>% mutate(y_num = row_number())
+  
+  # small vertical offsets so the markers do not overlap
+  d_long <- d_wide %>%
+    select(y_num, label_wrapped, none, intrastate, internationalised_intrastate) %>%
+    pivot_longer(c(none, intrastate, internationalised_intrastate),
+                 names_to = "conflict_type", values_to = "share") %>%
+    mutate(conflict_type = factor(conflict_type, levels = names(cols)),
+           y_pos = y_num + case_when(conflict_type == "intrastate" ~ 0.18,
+                                     conflict_type == "internationalised_intrastate" ~ -0.18,
+                                     TRUE ~ 0))
+  d_segments <- d_wide %>%
+    mutate(min_share = pmin(none, intrastate, internationalised_intrastate, na.rm = TRUE),
+           max_share = pmax(none, intrastate, internationalised_intrastate, na.rm = TRUE))
+  
+  ggplot() +
+    geom_hline(data = d_wide, aes(yintercept = y_num), colour = "grey93", linewidth = 0.5) +
+    geom_segment(data = d_segments, aes(x = min_share, xend = max_share, y = y_num, yend = y_num),
+                 colour = "grey70", linewidth = 0.7) +
+    geom_point(data = d_long, aes(x = share, y = y_pos, colour = conflict_type, shape = conflict_type),
+               size = 2.8, stroke = 0.6) +
+    scale_colour_manual(values = cols, labels = leg_labels, name = "Conflict status:") +
+    scale_shape_manual(values = shapes, labels = leg_labels, name = "Conflict status:") +
+    scale_y_continuous(breaks = 1:length(labels_ordered), labels = labels_ordered,
+                       expand = expansion(mult = c(0.04, 0.04))) +
+    scale_x_continuous(labels = scales::percent_format(accuracy = 1),
+                       expand = expansion(mult = c(0.01, 0.05))) +
+    labs(x = "Share of reported outbreaks within conflict category", y = NULL) +
+    theme_minimal(base_size = 10) +
+    theme(legend.position = "bottom", legend.direction = "vertical",
+          legend.title = element_text(face = "bold", size = 8.5),
+          legend.text = element_text(size = 8.2),
+          panel.grid.major.y = element_blank(), panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_line(colour = "grey92", linewidth = 0.3),
+          axis.text.y = element_text(colour = "grey15", size = 8.2, lineheight = 0.85),
+          axis.title.x = element_text(margin = margin(t = 8), size = 9),
+          plot.margin = margin(t = 10, r = 15, b = 10, l = 10)) +
+    guides(colour = guide_legend(override.aes = list(size = 3.2)),
+           shape  = guide_legend(override.aes = list(size = 3.2)))
 }
 
-fp_spec <- tibble::tribble(
-  ~disease,                    ~code, ~src,                     ~term_regex,                                  ~row_label,
-  "Pandemic influenza (J09)",  "J09", "results_logit_ctrl",     "conflict_typeintrastate$",                   "Intrastate (type)",
-  "Pandemic influenza (J09)",  "J09", "results_logit_int_ctrl", "intensityminor$",                            "Minor (intensity)",
-  "Pandemic influenza (J09)",  "J09", "results_logit_int_ctrl", "intensitywar$",                              "War (intensity)",
-  "Pandemic influenza (J09)",  "J09", "results_lag",            "intensity_lag2war$",                         "War, lag-2",
-  "Cholera (A00)",             "A00", "results_lag",            "intensity_lag1minor$",                       "Minor, lag-1",
-  "Cholera (A00)",             "A00", "results_lag",            "intensity_lag2war$",                         "War, lag-2",
-  "Cholera (A00)",             "A00", "results_ry_int",         "intensitywar$",                              "War (region\u00d7year FE)",
-  "Other VHF (A98)",           "A98", "results_logit_int_ctrl", "intensityminor$",                            "Minor (intensity)",
-  "Other VHF (A98)",           "A98", "results_logit_ctrl",     "conflict_typeinternationalised_intrastate$", "Internat. intrastate (type)",
-  "Poliomyelitis (A80)",       "A80", "results_logit_int_ctrl", "intensitywar$",                              "War (intensity)",
-  "Poliomyelitis (A80)",       "A80", "results_logit_int_ctrl", "intensityminor$",                            "Minor (intensity)",
-  "Poliomyelitis (A80)",       "A80", "results_logit_ctrl",     "conflict_typeintrastate$",                   "Intrastate (type)",
-  "Poliomyelitis (A80)",       "A80", "results_logit_ctrl",     "conflict_typeinternationalised_intrastate$", "Internat. intrastate (type)",
-  "Poliomyelitis (A80)",       "A80", "results_ry_type",        "conflict_typeintrastate$",                   "Intrastate (region\u00d7year FE)"
+# denominators: all reported disease-country-years in each conflict category
+den <- outbreak_with_conflict %>%
+  count(conflict_type) %>%
+  filter(conflict_type %in% c("none", "intrastate", "internationalised_intrastate"))
+den <- setNames(den$n, as.character(den$conflict_type))
+
+fig1_df <- outbreak_with_conflict %>%
+  filter(icd103c %in% top, conflict_type %in% names(den)) %>%
+  count(conflict_type, icd103c) %>%
+  left_join(disease_labels, by = "icd103c") %>%
+  mutate(conflict_type = as.character(conflict_type),
+         share = n / den[conflict_type],
+         label = paste0(lab_of(icd103c, icd103n), " (", icd103c, ")")) %>%
+  select(conflict_type, icd103c, label, share)
+
+fig1 <- make_fig1(fig1_df, den)
+ggsave(file.path(out_dir, "Fig1_disease_profile.pdf"), fig1, width = 8.5, height = 8.5)
+ggsave(file.path(out_dir, "Fig1_disease_profile.png"), fig1, width = 8.5, height = 8.5, dpi = 300, bg = "white")
+write_csv(fig1_df, file.path(out_dir, "Fig1_values.csv"))
+
+
+# 18. Figure 2: headline associations across specifications -------------------
+make_fig2 <- function(fd) {
+  kinds  <- c("Same-year estimate", "Lagged exposure", "Sensitivity analysis")
+  groups <- unique(fd$disease)
+  rows <- list(); bands <- list(); y <- 0
+  for (g in groups) {
+    sub <- filter(fd, disease == g)
+    top_y <- y
+    rows[[length(rows) + 1]] <- tibble(disease = g, row = NA, header = TRUE, y = y); y <- y - 1
+    sub$y <- y - seq_len(nrow(sub)) + 1; y <- y - nrow(sub)
+    rows[[length(rows) + 1]] <- mutate(sub, header = FALSE)
+    bands[[length(bands) + 1]] <- tibble(disease = g, ymax = top_y + 0.5, ymin = y + 0.5)
+    y <- y - 0.4
+  }
+  d <- bind_rows(rows) %>% mutate(kind = factor(kind, levels = kinds))
+  b <- bind_rows(bands) %>% mutate(shade = rep(c(TRUE, FALSE), length.out = n()))
+  pts <- filter(d, !header) %>%
+    mutate(odds_ratio = ifelse(is.finite(log(odds_ratio)), odds_ratio, NA_real_))
+  hdr <- filter(d, header)
+  pts$ci <- sprintf("%.2f (%.2f\u2013%.2f)", pts$odds_ratio, pts$or_low, pts$or_high)
+  xl <- c(0.04, 20)
+  
+  ggplot(pts) +
+    geom_rect(data = filter(b, shade), aes(xmin = 0, xmax = Inf, ymin = ymin, ymax = ymax),
+              fill = "#F4F4F4", inherit.aes = FALSE) +
+    annotate("segment", x = 1, xend = 1, y = min(d$y) - 0.5, yend = max(d$y) + 0.5,
+             colour = "grey45", linewidth = 0.4) +
+    geom_segment(aes(x = pmin(pmax(or_low, xl[1]), xl[2]), xend = pmax(pmin(or_high, xl[2]), xl[1]),
+                     y = y, yend = y), linewidth = 0.55, colour = "grey20") +
+    geom_point(aes(odds_ratio, y, shape = kind, fill = kind), size = 2.4, colour = "grey10", stroke = 0.5) +
+    geom_text(data = hdr, aes(x = xl[1], y = y, label = disease), hjust = 0, fontface = "bold", size = 3.4) +
+    geom_text(aes(x = 32, y = y, label = ci), hjust = 0, size = 2.9, colour = "grey20") +
+    annotate("text", x = 32, y = max(d$y) + 1, label = "OR (95% CI)", hjust = 0, size = 3, fontface = "bold") +
+    annotate("text", x = 0.9, y = min(d$y) - 1.1, label = "\u2190 Less often reported in conflict",
+             hjust = 1, size = 2.9, colour = "grey35") +
+    annotate("text", x = 1.1, y = min(d$y) - 1.1, label = "More often reported in conflict \u2192",
+             hjust = 0, size = 2.9, colour = "grey35") +
+    scale_shape_manual(values = c(22, 24, 21), drop = FALSE, name = NULL) +
+    scale_fill_manual(values = c("grey10", "grey55", "white"), drop = FALSE, name = NULL) +
+    scale_x_log10(breaks = c(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20),
+                  labels = c("0.05", "0.1", "0.25", "0.5", "1", "2", "5", "10", "20")) +
+    scale_y_continuous(breaks = pts$y, labels = pts$row, expand = expansion(add = c(1.3, 1.2))) +
+    coord_cartesian(xlim = xl, clip = "off") +
+    labs(x = "Odds ratio (log scale); reference = no conflict", y = NULL) +
+    theme_minimal(base_size = 10) +
+    theme(legend.position = "bottom", legend.text = element_text(size = 8.5),
+          panel.grid.major.y = element_blank(), panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_line(colour = "grey90", linewidth = 0.3),
+          axis.text.y = element_text(colour = "grey15", size = 8.8),
+          plot.margin = margin(10, 95, 6, 6))
+}
+
+pick <- function(df, code, pattern) {
+  r <- df %>% filter(icd103c == code, is_expo(., pattern))
+  if (nrow(r) > 1L) stop("More than one row for ", code, " / ", pattern)
+  if (nrow(r) == 0) tibble(odds_ratio = NA_real_, or_low = NA_real_, or_high = NA_real_)
+  else select(r, odds_ratio, or_low, or_high)
+}
+fig2_sources <- list(
+  res_type = res_type, res_intensity = res_intensity, res_lag = res_lag,
+  res_lag2_cond  = filter(res_lag_cond, exposure == "intensity_lag2"),
+  res_region     = res_region,
+  res_polio_excl = filter(res_polio_measles, str_starts(analysis, "polio")),
+  res_j09_excl   = filter(res_j09, str_starts(subset, "excluding") & !str_detect(subset, "2009")))
+
+S <- "Same-year estimate"; L <- "Lagged exposure"; X <- "Sensitivity analysis"
+fig2_spec <- tribble(
+  ~disease,                                ~code, ~src,             ~pattern,                                     ~row,                                          ~kind,
+  "Acute poliomyelitis (A80)",             "A80", "res_type",       "conflict_typeintrastate$",                   "Intrastate",                                  S,
+  "Acute poliomyelitis (A80)",             "A80", "res_type",       "conflict_typeinternationalised_intrastate$", "Internationalised intrastate",                S,
+  "Acute poliomyelitis (A80)",             "A80", "res_intensity",  "intensityminor$",                            "Minor intensity",                             S,
+  "Acute poliomyelitis (A80)",             "A80", "res_intensity",  "intensitywar$",                              "War",                                         S,
+  "Acute poliomyelitis (A80)",             "A80", "res_region",     "conflict_typeintrastate$",                   "Intrastate, region \u00d7 year FE",           X,
+  "Acute poliomyelitis (A80)",             "A80", "res_polio_excl", "conflict_typeintrastate$",                   "Intrastate, excl. WPV-endemic countries",     X,
+  "Cholera (A00)",                         "A00", "res_intensity",  "intensitywar$",                              "War",                                         S,
+  "Cholera (A00)",                         "A00", "res_lag",        "intensity_lag1minor$",                       "Minor, 1-year lag",                           L,
+  "Cholera (A00)",                         "A00", "res_lag",        "intensity_lag2war$",                         "War, 2-year lag",                             L,
+  "Cholera (A00)",                         "A00", "res_lag2_cond",  "intensity_lag2war$",                         "War, 2-year lag, adj. for current conflict",  L,
+  "Cholera (A00)",                         "A00", "res_region",     "intensitywar$",                              "War, region \u00d7 year FE",                  X,
+  "Zoonotic/pandemic influenza (J09)",     "J09", "res_type",       "conflict_typeintrastate$",                   "Intrastate",                                  S,
+  "Zoonotic/pandemic influenza (J09)",     "J09", "res_intensity",  "intensityminor$",                            "Minor intensity",                             S,
+  "Zoonotic/pandemic influenza (J09)",     "J09", "res_intensity",  "intensitywar$",                              "War",                                         S,
+  "Zoonotic/pandemic influenza (J09)",     "J09", "res_lag",        "intensity_lag2war$",                         "War, 2-year lag",                             L,
+  "Zoonotic/pandemic influenza (J09)",     "J09", "res_j09_excl",   "conflict_typeintrastate$",                   "Intrastate, excl. 5 principal notifiers",     X,
+  "Zoonotic/pandemic influenza (J09)",     "J09", "res_j09_excl",   "intensitywar$",                              "War, excl. 5 principal notifiers",            X,
+  "Other viral haemorrhagic fevers (A98)", "A98", "res_type",       "conflict_typeinternationalised_intrastate$", "Internationalised intrastate",                S,
+  "Other viral haemorrhagic fevers (A98)", "A98", "res_intensity",  "intensityminor$",                            "Minor intensity",                             S
 )
-
-group_levels <- c("Pandemic influenza (J09)", "Cholera (A00)",
-                  "Other VHF (A98)", "Poliomyelitis (A80)")
-pal <- c("Pandemic influenza (J09)" = "#C44E52", "Cholera (A00)" = "#55A868",
-         "Other VHF (A98)" = "#4C72B0", "Poliomyelitis (A80)" = "#8172B3")
-
-fp_df <- fp_spec %>%
-  mutate(vals = purrr::pmap(list(src, code, term_regex),
-                            function(s, cc, rgx) get_or(get(s), cc, rgx))) %>%
-  tidyr::unnest(vals) %>%
+fig2_df <- fig2_spec %>%
+  mutate(vals = pmap(list(src, code, pattern), function(s, cc, p) pick(fig2_sources[[s]], cc, p))) %>%
+  unnest(vals) %>%
   filter(!is.na(odds_ratio)) %>%
-  mutate(disease = factor(disease, levels = group_levels)) %>%
-  arrange(disease)
+  select(disease, row, kind, odds_ratio, or_low, or_high)
+fig2 <- make_fig2(fig2_df)
+ggsave(file.path(out_dir, "Fig2_forest.pdf"), fig2, width = 7.6, height = 7.4)
+ggsave(file.path(out_dir, "Fig2_forest.png"), fig2, width = 7.6, height = 7.4, dpi = 300, bg = "white")
+write_csv(fig2_df, file.path(out_dir, "Fig2_values.csv"))
 
-# numeric y positions, top -> bottom, with a gap between disease groups
-gap <- 0.9; yv <- numeric(nrow(fp_df)); y <- 0; prev <- NA
-for (i in seq_len(nrow(fp_df))) {
-  if (!is.na(prev) && fp_df$disease[i] != prev) y <- y - gap
-  y <- y - 1; yv[i] <- y; prev <- fp_df$disease[i]
+
+# 19. Summary and fit notes ---------------------------------------------------
+fmt <- function(df, pattern) df %>%
+  filter(icd103c %in% key, is_expo(., pattern), !is.na(level)) %>%
+  transmute(disease = lab_of(icd103c, icd103n), term,
+            OR = sprintf("%.2f (%.2f-%.2f)", odds_ratio, or_low, or_high),
+            p = signif(p.value, 3), n_countries, events_exposed, sparse,
+            across(any_of("analysis")))
+
+old_width <- options(width = 200)
+sink(file.path(out_dir, "summary.txt"))
+cat("Run:", format(Sys.time()), "\n\n")
+print(as.data.frame(flow)); cat("\n")
+print(as.data.frame(desc_type)); print(as.data.frame(desc_intensity)); cat("\n")
+cat("FDR primary family:", sum(prim), "tests;", sum(fdr$q_primary < 0.05, na.rm = TRUE), "with q < 0.05\n")
+cat("With lags:", sum(fdr$eligible), "tests;", sum(fdr$q_with_lags < 0.05, na.rm = TRUE), "with q < 0.05\n\n")
+for (x in list(list("Conflict type", res_type, "^conflict_type"),
+               list("Intensity", res_intensity, "^intensity"),
+               list("Lagged", filter(res_lag, icd103c %in% HEADLINE), "_lag"),
+               list("Lagged, adjusted for current intensity", res_lag_cond, "_lag"),
+               list("New reports", res_new, "."),
+               list("Duration", res_duration, "duration"),
+               list("Measles and polio", res_polio_measles, "."))) {
+  cat("---", x[[1]], "---\n"); print(as.data.frame(fmt(x[[2]], x[[3]]))); cat("\n")
 }
-fp_df$y <- yv
+cat("--- Bootstrap (percentile intervals) ---\n")
+print(as.data.frame(select(res_boot, icd103c, term, odds_ratio, boot_low, boot_high,
+                           replicates_failed, replicates_extreme)))
+cat("\n--- Count models (IRR) ---\n")
+print(as.data.frame(select(res_count, exposure, term, controls, fe, irr, irr_low, irr_high, p.value)))
+sink()
+options(old_width)
 
-grp <- fp_df %>% group_by(disease) %>% summarise(ymid = mean(y), .groups = "drop")
-ytop <- max(fp_df$y)
+# warnings, convergence problems and dropped collinear terms from all logit families
+fit_notes <- bind_rows(list(primary_type = res_type, primary_intensity = res_intensity,
+                            no_controls = res_nocontrol, no_controls_complete_cases = res_same_sample,
+                            lagged = res_lag, lagged_given_current = res_lag_cond, region_year = res_region,
+                            sensitivity = sens, lpm_matched = lpm_matched, j09_exclusions = res_j09,
+                            new_reports = res_new, duration = res_duration, measles_polio = res_polio_measles),
+                       .id = "source") %>%
+  filter(!is.na(fit_note) | !is.na(collinear_terms)) %>%
+  distinct(source, icd103c, exposure, fe, controls, fit_note, collinear_terms)
+write_csv(fit_notes, file.path(out_dir, "model_fit_notes.csv"))
 
-fig1 <- ggplot(fp_df, aes(odds_ratio, y, colour = disease)) +
-  geom_vline(xintercept = 1, linetype = "22", colour = "grey55", linewidth = 0.5) +
-  geom_segment(aes(x = or_low, xend = or_high, y = y, yend = y),
-               linewidth = 0.8, lineend = "round") +
-  geom_point(aes(fill = disease), shape = 22, size = 3.2, stroke = 0.5, colour = "white") +
-  # colour-coded disease labels in the right margin
-  geom_text(data = grp, aes(x = 26, y = ymid, label = disease, colour = disease),
-            hjust = 0, fontface = "bold", size = 4) +
-  # protective / elevated cue
-  annotate("text", x = 0.78, y = ytop + 0.9, label = "protective \u2190",
-           hjust = 1, size = 3.2, colour = "grey55") +
-  annotate("text", x = 1.28, y = ytop + 0.9, label = "\u2192 elevated",
-           hjust = 0, size = 3.2, colour = "grey55") +
-  scale_x_log10(breaks = c(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20),
-                labels = c("0.05","0.1","0.25","0.5","1","2","5","10","20")) +
-  scale_y_continuous(breaks = fp_df$y, labels = fp_df$row_label) +
-  scale_colour_manual(values = pal) + scale_fill_manual(values = pal) +
-  coord_cartesian(xlim = c(0.03, 20), ylim = c(min(fp_df$y) - 0.6, ytop + 1.4),
-                  clip = "off") +
-  labs(x = "Odds ratio (95% CI), log scale", y = NULL,
-       title = "Reported-outbreak associations stable across specifications",
-       subtitle = "Within-country fixed-effects logistic models; reference = peaceful country-years") +
-  theme_minimal(base_size = 12) +
-  theme(
-    legend.position    = "none",
-    plot.title         = element_text(face = "bold", size = 14, margin = margin(b = 2)),
-    plot.subtitle      = element_text(size = 10.5, colour = "grey35", margin = margin(b = 16)),
-    panel.grid.major.y = element_blank(),
-    panel.grid.minor   = element_blank(),
-    panel.grid.major.x = element_line(colour = "grey92", linewidth = 0.4),
-    axis.text.y        = element_text(size = 10, colour = "grey20"),
-    axis.text.x        = element_text(size = 9.5, colour = "grey30"),
-    axis.title.x       = element_text(size = 11, margin = margin(t = 8)),
-    axis.ticks         = element_blank(),
-    plot.margin        = margin(t = 10, r = 145, b = 10, l = 8)
-  )
-
-ggsave(file.path(out_dir, "figure1_forest.png"), fig1,
-       width = 10.8, height = 7.4, dpi = 300, bg = "white")
-# vector version for submission:
-# ggsave(file.path(out_dir, "figure1_forest.pdf"), fig1, width = 10.8, height = 7.4)
-
-
-# =============================================================================
-# Reproducibility: record the R session --------------------------------------
-writeLines(capture.output(sessionInfo()),
-           file.path(out_dir, "sessionInfo.txt"))
-cat("\nDone. All outputs written to:", normalizePath(out_dir), "\n")
+writeLines(capture.output(sessionInfo()), file.path(out_dir, "sessionInfo.txt"))
+cat("Done. Outputs in", normalizePath(out_dir), "\n")
